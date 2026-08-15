@@ -26,6 +26,84 @@ flowchart LR
 
 ---
 
+## 🗺️ Mapa Mental — Visão Geral de Todos os Tópicos
+
+```mermaid
+mindmap
+  root((API Gateway))
+    1. Tipos de API
+      REST API
+      HTTP API
+      WebSocket API
+    2. Tipos de Endpoint
+      Edge-Optimized
+      Regional
+      Private
+    3. Domínio customizado
+      ACM certificado TLS
+      Custom Domain Name
+      Route 53
+    4. VPC Link
+      v1 — NLB obrigatório
+      v2 — direto no ALB
+    5. Tipos de integração
+      Lambda Proxy
+      Lambda Custom — VTL
+      HTTP Proxy
+      AWS Service direta
+    6. Autenticação
+      IAM — SigV4
+      Cognito — JWT
+      Lambda Authorizer
+    7. Resource Policy
+      IP de origem
+      VPC Endpoint
+      Conta AWS
+    8. Throttling
+      Token Bucket
+      Usage Plans
+      API Keys
+    9. Cache
+      Cache Key
+      TTL
+      Invalidação
+    10. CORS
+      Preflight OPTIONS
+      Access-Control-Allow-Origin
+    11. Mapping Templates VTL
+      input.params
+      input.json
+      context
+    12. Stages e Canary
+      dev staging prod
+      Canary Deployment
+    13. Monitoramento
+      CloudWatch
+      X-Ray
+    14. WAF
+      Rate-based rules
+      Managed Rule Groups
+      IP sets
+      Geo-blocking
+    15. Gateway Responses
+      DEFAULT_4XX e DEFAULT_5XX
+      MISSING_AUTHENTICATION_TOKEN
+    16. Custo
+      REST API
+      HTTP API
+      WebSocket API
+      Cache
+    17. Boas práticas
+      Autenticação obrigatória
+      Usage Plan com quota
+      Least privilege
+      Access Logs
+      Secrets Manager
+```
+*Visão geral de todos os tópicos deste guia, organizados como aparecem nas seções abaixo.*
+
+---
+
 ## 1. REST API vs HTTP API vs WebSocket API
 
 ### REST API
@@ -234,6 +312,26 @@ flowchart TD
     T -->|"AWS Service Integration"| S["Chama a API do serviço AWS direto\n(ex: SQS SendMessage, DynamoDB PutItem)\nsem Lambda no meio"]
 ```
 *Os quatro tipos de integração e o que acontece com a requisição em cada um.*
+
+### HTTP API vs REST API — o que cada integração suporta
+
+Nem toda integração está disponível nos dois tipos de API. Essa é uma pegadinha comum: você desenha a arquitetura pensando em HTTP API (mais barata) e descobre depois que precisa de um recurso que só existe em REST API.
+
+| Integração / recurso | REST API | HTTP API |
+|---|---|---|
+| **Lambda Proxy** | ✅ | ✅ |
+| **Lambda Custom (non-proxy, com VTL)** | ✅ | ❌ — só existe o modo proxy |
+| **HTTP Proxy** | ✅ | ✅ |
+| **HTTP Custom (non-proxy, com VTL)** | ✅ | ❌ — só existe o modo proxy |
+| **AWS Service Integration direta** (SQS, DynamoDB, SNS, EventBridge, Step Functions, etc.) | ✅ desde o início | ✅ — mas só a partir de nov/2022 ("HTTP API direct integrations"), cobrindo cerca de 30 serviços |
+| **Mock Integration** (resposta simulada, sem backend) | ✅ | ❌ — não existe em HTTP API |
+| **Mapping Templates completos (VTL)** — transformar body/headers com lógica | ✅ | ❌ — só **parameter mapping** simples (ex: `$request.querystring.id`), sem lógica VTL |
+| **VPC Link (integração privada)** | v1 (com NLB obrigatório) ou v2 (direto no ALB, desde nov/2025) | Apenas v2 (direto em ALB/NLB/Cloud Map) |
+| **API Keys e Usage Plans nativos** | ✅ | ❌ — não tem suporte nativo (precisa controlar quota de outra forma, ex: Lambda Authorizer + DynamoDB) |
+| **WAF** | ✅ (associação direta) | ❌ — precisa de CloudFront na frente |
+| **Cache de resposta** | ✅ | ❌ — não existe cache nativo em HTTP API |
+
+**Resumindo o critério na prática:** se o seu caso de uso é só "expor uma Lambda ou repassar pra um backend HTTP/ALB", **HTTP API** cobre bem, inclusive com integração direta a boa parte dos serviços AWS mais usados (SQS, EventBridge, Step Functions...). Mas no momento que você precisa de **VTL completo, Mock Integration, cache nativo, API Keys/Usage Plans ou WAF direto**, isso empurra a escolha de volta para **REST API**.
 
 ---
 

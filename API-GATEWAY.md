@@ -262,7 +262,7 @@ Nem toda integração está disponível nos dois tipos de API. Essa é uma pegad
 ### IAM Authorization
 Usa as credenciais AWS do chamador (Access Key + Secret Key, assinando a requisição com **SigV4**). O API Gateway verifica se essa identidade (usuário/role IAM) tem uma **policy IAM** permitindo `execute-api:Invoke` naquele recurso.
 
-**Uso real:** comunicação **serviço-a-serviço** dentro da AWS — ex: uma Lambda de outro sistema chamando sua API, ou um serviço em outra conta AWS (cross-account). Não é prático para usuários finais porque exigiria expor Access Keys no frontend, o que é inseguro.
+**Uso real:** comunicação **serviço-a-serviço** dentro da AWS — ex: uma **instância EC2 com a role IAM correta** chamando sua API, uma Lambda de outro sistema, ou um serviço em outra conta AWS (cross-account). Não é prático para usuários finais porque exigiria expor Access Keys no frontend, o que é inseguro.
 
 ### Cognito User Pools (JWT)
 O fluxo completo:
@@ -273,12 +273,19 @@ O fluxo completo:
 
 **Uso real:** a combinação padrão para apps web/mobile modernos (SPA em React, app mobile) — é o "login com usuário e senha" clássico.
 
+**Suporte por tipo de API:** as duas suportam Cognito, mas por mecanismos diferentes — em **REST API** é um **Cognito User Pool Authorizer** nativo; em **HTTP API** é um **JWT Authorizer** (o mesmo mecanismo usado para qualquer provedor OIDC) apontando o Cognito User Pool como emissor do token.
+
 ### Lambda Authorizer (Custom Authorizer)
 Você escreve uma Lambda que recebe o token/headers da requisição e devolve uma **policy IAM customizada** dizendo se permite ou não, além de um `context` opcional que fica disponível pro backend.
 
 **Quando usar no dia a dia:** quando seu sistema de autenticação não é Cognito (ex: você já tem um sistema de auth próprio, ou usa Auth0/Okta, ou valida um token de uma API de parceiro).
 
 **Detalhe de performance importante:** por padrão o resultado do Lambda Authorizer é **cacheado por até 1 hora** (configurável) usando o token como chave — isso evita que toda requisição dispare uma nova execução da Lambda de auth, reduzindo custo e latência. Isso é um detalhe que passa despercebido e pode gerar bugs — "mudei a permissão do usuário mas a API não pegou" geralmente é isso.
+
+### API Keys
+Diferente dos três mecanismos acima, a API Key **não é um mecanismo de autenticação/autorização real** — é só uma string que **identifica o cliente** chamando a API, usada em conjunto com **Usage Plans** (seção 8) para aplicar quota/throttling por cliente. A própria AWS é explícita sobre isso: não use API Key como se fosse senha ou proteção de dados sensíveis — ela viaja em texto simples no header `x-api-key` e não prova identidade de ninguém.
+
+**Suporte por tipo de API:** API Keys e Usage Plans nativos só existem em **REST API**. Em **HTTP API** não há suporte nativo — se você precisa de controle de quota por cliente lá, a alternativa comum é um Lambda Authorizer validando uma chave própria.
 
 ```mermaid
 flowchart TD
@@ -333,6 +340,8 @@ O throttling do API Gateway usa o algoritmo de **Token Bucket**:
 - Cada requisição consome 1 token. Se o balde está vazio, a requisição é rejeitada com **HTTP 429**.
 
 Isso permite picos curtos de tráfego (usando o burst acumulado) sem rejeitar tudo, mas protege contra tráfego sustentado alto.
+
+**Suporte por tipo de API:** o throttling em si (limites de rate/burst por conta, por stage ou por rota) protege o backend contra sobrecarga de tráfego em **REST API e HTTP API** igualmente. Já os **Usage Plans associados a API Keys** (planos nomeados tipo "Free tier" vs "Pro" citados abaixo) são um recurso **exclusivo de REST API** — HTTP API não tem esse gerenciamento nativo de planos por cliente.
 
 **Usage Plans no dia a dia:** são usados para **API monetizada** — ex: você vende acesso à sua API para clientes externos, cada um recebe uma API Key associada a um plano (ex: "Free tier: 100 req/dia" vs "Pro: 10.000 req/dia"). É literalmente o modelo usado por diversos SaaS que vendem acesso a API.
 

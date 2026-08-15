@@ -1,1 +1,1 @@
-# SAA---Solution-Architect-Associate
+# SAA - Solution-Architect-Associate

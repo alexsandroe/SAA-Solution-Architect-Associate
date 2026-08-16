@@ -61,6 +61,26 @@ Cada uma dessas rotas pode acionar uma Lambda diferente. É bem mais "evento" do
 
 **Custo no dia a dia:** você paga por tempo de conexão ativa + por mensagem trafegada — diferente de REST/HTTP API que cobra só por requisição.
 
+#### O que o WebSocket API suporta e o que não suporta
+
+| Recurso | Suporte |
+|---|---|
+| Comunicação bidirecional, conexões de longa duração | ✅ — é o motivo dele existir |
+| Integração com Lambda (proxy) | ✅ — uma função por rota (`$connect`, `$disconnect`, `$default`, rotas customizadas) |
+| Integração direta com serviço AWS (ex: SQS, DynamoDB) | ✅ |
+| Integração privada via **VPC Link** (ALB/NLB) | ✅ — mesmo mecanismo usado por REST/HTTP API |
+| Mapping Templates (VTL) | ✅ — para transformar a mensagem antes de chegar no backend |
+| Roteamento por conteúdo da mensagem (route selection expression) | ✅ |
+| **IAM Authorization** | ✅ |
+| **Lambda Authorizer** (custom) | ✅ — a única forma de plugar autenticação própria |
+| Cognito User Pool Authorizer nativo | ❌ — não existe para WebSocket, diferente de REST/HTTP API |
+| JWT Authorizer nativo (o tipo usado em HTTP API) | ❌ — não existe para WebSocket |
+| API Keys / Usage Plans | ❌ — recurso exclusivo de REST API |
+| WAF | ❌ — só se associa a REST API regional ou a CloudFront |
+| Cache de resposta | ❌ — não existe esse conceito aqui, não é request/response |
+
+**Pegadinha clássica de prova:** como Cognito funciona "de fábrica" em REST API e HTTP API, muita gente assume que também funciona assim em WebSocket API. Não funciona — o único authorizer nativo além de IAM é o **Lambda Authorizer**, e é dentro dele que você validaria o JWT do Cognito manualmente. Na prática isso também resolve outro problema: o WebSocket nativo do navegador não permite mandar um header `Authorization` customizado na conexão inicial, então o token costuma viajar via **query string** no `$connect`, e é o Lambda Authorizer quem lê e valida esse token.
+
 ```mermaid
 flowchart TD
     Q{"Que tipo de API você precisa?"}
@@ -273,7 +293,7 @@ O fluxo completo:
 
 **Uso real:** a combinação padrão para apps web/mobile modernos (SPA em React, app mobile) — é o "login com usuário e senha" clássico.
 
-**Suporte por tipo de API:** as duas suportam Cognito, mas por mecanismos diferentes — em **REST API** é um **Cognito User Pool Authorizer** nativo; em **HTTP API** é um **JWT Authorizer** (o mesmo mecanismo usado para qualquer provedor OIDC) apontando o Cognito User Pool como emissor do token.
+**Suporte por tipo de API:** REST API e HTTP API suportam Cognito, mas por mecanismos diferentes — em **REST API** é um **Cognito User Pool Authorizer** nativo; em **HTTP API** é um **JWT Authorizer** (o mesmo mecanismo usado para qualquer provedor OIDC) apontando o Cognito User Pool como emissor do token. **WebSocket API não tem nenhum dos dois** — lá, a única forma é um Lambda Authorizer validando o token manualmente (ver seção 1).
 
 ### Lambda Authorizer (Custom Authorizer)
 Você escreve uma Lambda que recebe o token/headers da requisição e devolve uma **policy IAM customizada** dizendo se permite ou não, além de um `context` opcional que fica disponível pro backend.

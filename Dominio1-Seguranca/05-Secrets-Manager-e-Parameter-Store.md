@@ -87,6 +87,20 @@ flowchart TD
 ```
 *Labels de versão controlam qual credencial está "ativa" em cada momento, permitindo rollback.*
 
+#### 🔬 Mini-POC — forçar uma rotação e ver os labels de versão mudarem
+
+**Por que fazer isso:** entender `AWSCURRENT`/`AWSPREVIOUS`/`AWSPENDING` de verdade exige ver esses labels se moverem entre versões, não só ler a definição.
+
+**Passos:**
+1. Crie um secret simples: `aws secretsmanager create-secret --name poc/rotacao --secret-string '{"usuario":"admin","senha":"Senha123!"}'`.
+2. Liste as versões: `aws secretsmanager list-secret-version-ids --secret-id poc/rotacao` — note a única versão com o label `AWSCURRENT`.
+3. Como não há um banco real associado, crie manualmente uma nova versão com `put-secret-value` (isso simula o que a etapa `createSecret` faria): `aws secretsmanager put-secret-value --secret-id poc/rotacao --secret-string '{"usuario":"admin","senha":"NovaSenha456!"}'`.
+4. Liste as versões de novo e observe que agora existem duas: a nova com `AWSCURRENT` e a antiga com `AWSPREVIOUS`.
+5. Recupere especificamente a versão anterior: `aws secretsmanager get-secret-value --secret-id poc/rotacao --version-stage AWSPREVIOUS`.
+6. Simule um rollback movendo o label manualmente: `aws secretsmanager update-secret-version-stage --secret-id poc/rotacao --version-stage AWSCURRENT --move-to-version-id <version-id-antigo> --remove-from-version-id <version-id-novo>`.
+
+**O que observar:** o valor "atual" do secret muda instantaneamente para a aplicação sem apagar a versão anterior — é exatamente esse mecanismo de label que permite reverter uma rotação malsucedida sem recriar nada.
+
 ---
 
 ## 2. SSM Parameter Store
@@ -144,6 +158,20 @@ flowchart TD
 ```
 *Parameter Store: dois tiers de custo/limite, dois tipos de criptografia, organizado hierarquicamente.*
 
+#### 🔬 Mini-POC — a permissão que realmente falta quando `SecureString` não decripta
+
+**Por que fazer isso:** assim como no KMS, a pegadinha aqui é achar que só a permissão do SSM basta — na prática, é a permissão KMS na CMK que decide se você lê o valor decriptado.
+
+**Passos:**
+1. Crie uma CMK dedicada: `aws kms create-key --description "poc-ssm"` e um alias `alias/poc-ssm`.
+2. Crie um `SecureString` usando essa CMK (não a `aws/ssm` padrão): `aws ssm put-parameter --name "/poc/senha" --value "Segredo123" --type SecureString --key-id alias/poc-ssm`.
+3. Crie uma role de teste com uma IAM Policy que permite `ssm:GetParameter` em `*`, mas **sem** nenhuma permissão de KMS na Key Policy ou IAM para essa role.
+4. Assumindo essa role, rode `aws ssm get-parameter --name "/poc/senha" --with-decryption` e observe o erro de acesso negado (vindo do KMS, não do SSM).
+5. Adicione à Key Policy (ou a uma IAM Policy da role, se a Key Policy delegar para IAM) a permissão `kms:Decrypt` para essa role.
+6. Repita o passo 4 e confirme que agora decripta normalmente.
+
+**O que observar:** a mensagem de erro no passo 4 aponta para o KMS, não para o SSM — reforçando que `SecureString` é, por baixo dos panos, uma chamada de KMS acoplada à leitura do parâmetro, sujeita às mesmas regras de Key Policy vistas no arquivo de KMS.
+
 ---
 
 ## 3. Tabela comparativa completa
@@ -200,6 +228,19 @@ flowchart TB
     App --> SQS
 ```
 *Credenciais de banco e chaves de terceiro no Secrets Manager; configuração leve e não sensível no Parameter Store.*
+
+#### 🔬 Mini-POC — EC2 buscando um secret só com a role da instância, sem chave hardcoded
+
+**Por que fazer isso:** é o padrão real mais importante do dia a dia de um arquiteto — nenhuma credencial de longa duração viaja para dentro da instância, só permissões via IAM Role.
+
+**Passos:**
+1. Crie um secret de teste: `aws secretsmanager create-secret --name poc/app-db --secret-string '{"usuario":"app","senha":"Segredo123"}'`.
+2. Crie uma IAM Role com uma policy permitindo só `secretsmanager:GetSecretValue` no ARN desse secret específico, e associe essa role como **Instance Profile** a uma instância EC2 (nova ou existente).
+3. Conecte na instância (via Session Manager, sem chave SSH) e rode, **sem configurar nenhuma credencial**: `aws secretsmanager get-secret-value --secret-id poc/app-db --region <sua-regiao>`.
+4. Confirme que funciona mesmo sem `aws configure` ter sido rodado na instância — o SDK/CLI pega as credenciais temporárias automaticamente do metadata service (IMDS) via o instance profile.
+5. Para comparar, remova a policy da role e repita o comando — confirme que agora falha.
+
+**O que observar:** em nenhum momento existe uma access key ou senha gravada na instância — a EC2 só "empresta" as permissões temporárias da role associada, que expiram e são renovadas automaticamente. É esse mecanismo (não hardcode, nunca) que separa uma arquitetura real de produção de um script de estudo.
 
 ---
 

@@ -117,6 +117,30 @@ flowchart TD
 - **Serviços AWS agindo em seu nome** — ex: Lambda precisa de uma **execution role** para gravar logs
   no CloudWatch, API Gateway precisa de uma role para chamar SQS diretamente.
 
+#### 🔬 Mini-POC — Access Key de longa duração vs credenciais temporárias de Role
+
+**Por que fazer isso:** a tabela acima é fácil de concordar em teoria, mas só faz "clicar" de verdade
+quando você vê, lado a lado, que uma resposta tem campo de expiração e a outra não tem nenhum.
+
+**Passos:**
+1. Crie um usuário só para o teste: `aws iam create-user --user-name poc-access-key`.
+2. Gere uma Access Key para ele: `aws iam create-access-key --user-name poc-access-key`. Repare que o
+   JSON de resposta **não tem nenhum campo de expiração** — essa credencial é válida até você revogá-la
+   manualmente.
+3. Configure um profile temporário com essas credenciais (`aws configure --profile poc-key`) e rode
+   `aws sts get-caller-identity --profile poc-key` — note o `Arn` no formato `user/poc-access-key`.
+4. Crie uma role assumível pela sua própria conta (trust policy com `Principal: {"AWS": "arn:...:root"}`)
+   e rode `aws sts assume-role --role-arn ARN_DA_ROLE --role-session-name teste-poc`.
+5. Compare o JSON de resposta do passo 4 com o do passo 2: agora existe um campo `Credentials.Expiration`
+   (tipicamente 1 hora à frente) e um `SessionToken` — nenhum dos dois existe numa Access Key de User.
+6. Exporte as credenciais temporárias como variáveis de ambiente e rode `aws sts get-caller-identity`
+   de novo — o `Arn` agora aparece como `assumed-role/...`, não `user/...`.
+7. Limpe o ambiente: `aws iam delete-access-key` e `aws iam delete-user` para o usuário de teste.
+
+**O que observar:** a ausência do campo `Expiration` na Access Key é o motivo real, técnico, por trás da
+recomendação "prefira Roles" — não é só uma boa prática abstrata, é uma diferença visível no próprio JSON
+retornado pela API.
+
 ---
 
 ## 2. Anatomia de uma Policy JSON
@@ -190,6 +214,40 @@ flowchart LR
 precisar que o outro lado assuma uma Role** — por exemplo, uma bucket policy do S3 permitindo que a conta
 `999999999999` leia objetos diretamente. Isso é mais simples em alguns cenários (ex: parceiros externos
 lendo dados publicados), mas dá menos controle de auditoria do que o padrão AssumeRole.
+
+#### 🔬 Mini-POC — Policy least-privilege na prática: `GetObject` não é `ListBucket`
+
+**Por que fazer isso:** ler a anatomia de uma policy no papel esconde uma pegadinha muito comum: ações
+que parecem "relacionadas" (ler um objeto vs listar o que existe num bucket) são permissões **totalmente
+independentes**, e só escrever uma policy real e testar contra o S3 deixa isso óbvio.
+
+**Passos:**
+1. Crie um bucket de teste: `aws s3 mb s3://poc-least-privilege-SEU_ID`.
+2. Suba um arquivo como admin: `aws s3 cp teste.txt s3://poc-least-privilege-SEU_ID/teste.txt`.
+3. Crie um usuário `poc-restrito` e anexe **apenas** esta policy inline (não use nenhuma managed policy):
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": "s3:GetObject",
+         "Resource": "arn:aws:s3:::poc-least-privilege-SEU_ID/*"
+       }
+     ]
+   }
+   ```
+4. Gere uma Access Key para `poc-restrito` e configure um profile CLI com ela.
+5. Rode `aws s3 cp teste.txt s3://poc-least-privilege-SEU_ID/outro.txt --profile poc-restrito`
+   (tentando um `PutObject`) — deve falhar com `AccessDenied`, porque só `GetObject` foi concedido.
+6. Rode `aws s3api get-object --bucket poc-least-privilege-SEU_ID --key teste.txt saida.txt --profile poc-restrito`
+   — deve funcionar.
+7. Agora rode `aws s3 ls s3://poc-least-privilege-SEU_ID/ --profile poc-restrito` — deve falhar de novo,
+   porque `s3:ListBucket` **nunca foi concedido**, mesmo `GetObject` funcionando perfeitamente.
+
+**O que observar:** o erro do passo 7 é a pegadinha real — muita gente assume que "ter acesso ao bucket"
+é uma coisa só, mas `GetObject` (ler um objeto que você já sabe o nome) e `ListBucket` (enumerar o que
+existe) são `Action`s IAM completamente separadas, e o exame adora testar exatamente essa distinção.
 
 ---
 
@@ -362,6 +420,28 @@ intenção, consiga assumir sua Role usando as credenciais do terceiro.
 Não é — faltando a permissão de `sts:AssumeRole` do lado de quem está chamando (Conta A), a assunção
 falha mesmo com a trust policy da Conta B toda certa. As duas pontas precisam concordar.
 
+#### 🔬 Mini-POC — `ExternalId` bloqueando o confused deputy problem
+
+**Por que fazer isso:** entender POR QUE o `sts:ExternalId` existe é muito mais fácil vendo ele bloquear
+uma assunção de Role de verdade do que lendo a explicação teórica sobre "confused deputy".
+
+**Passos:**
+1. Crie uma role `poc-cross-account` com a trust policy do exemplo acima, mas usando o ARN da sua própria
+   conta como `Principal` (se você não tiver uma segunda conta AWS disponível, o exercício funciona igual
+   dentro da mesma conta — o que importa é a lógica da condição, não a fronteira de conta em si).
+2. Anexe `AmazonS3ReadOnlyAccess` como permission policy da role.
+3. Tente assumi-la **sem** informar o External ID:
+   `aws sts assume-role --role-arn ARN_DA_ROLE --role-session-name teste`
+4. Observe o erro `AccessDenied` — a trust policy exige a condição `sts:ExternalId` e ela não foi
+   satisfeita, mesmo você sendo o principal correto.
+5. Agora repita com o External ID certo:
+   `aws sts assume-role --role-arn ARN_DA_ROLE --role-session-name teste --external-id id-combinado-com-o-parceiro`
+6. Confirme que dessa vez a chamada funciona e retorna credenciais temporárias normalmente.
+
+**O que observar:** o `Principal` estar certo não é suficiente — a condição `ExternalId` tem que bater
+exatamente. É esse detalhe que impede outro cliente do mesmo parceiro/SaaS (que também recebeu permissão
+para assumir roles parecidas) de acidentalmente (ou maliciosamente) assumir a role de outra empresa.
+
 ---
 
 ## 7. STS — Security Token Service
@@ -510,6 +590,29 @@ flowchart TD
 **No dia a dia:** é uma das primeiras coisas que um time de segurança configura numa conta nova —
 rodando continuamente (não é uma checagem pontual), ele avisa automaticamente quando alguém, por engano,
 torna um bucket ou uma Role acessível de fora sem perceber.
+
+#### 🔬 Mini-POC — Vendo o Access Analyzer pegar um vazamento de acesso de verdade
+
+**Por que fazer isso:** o valor real do Access Analyzer só aparece quando você o vê detectar (e depois
+confirmar a correção de) um acesso externo que você mesmo criou de propósito — muito mais convincente do
+que só ler que ele "analisa resource-based policies".
+
+**Passos:**
+1. Ative o analyzer com zona de confiança = a própria conta:
+   `aws accessanalyzer create-analyzer --analyzer-name poc-analyzer --type ACCOUNT`
+2. Crie um bucket de teste e aplique uma bucket policy concedendo `s3:GetObject` para uma conta externa
+   fictícia (qualquer Account ID de 12 dígitos que não seja o seu, ex: `111111111111`).
+3. Espere alguns minutos (o Access Analyzer roda de forma assíncrona) e liste os findings:
+   `aws accessanalyzer list-findings --analyzer-arn ARN_DO_ANALYZER`
+4. Inspecione o finding retornado — ele aponta exatamente o bucket, a ação (`s3:GetObject`) e o principal
+   externo (`111111111111`) responsável pelo acesso.
+5. Remova o principal externo da bucket policy (corrija o "vazamento").
+6. Liste os findings de novo — o finding correspondente muda de status para resolvido automaticamente,
+   sem você precisar arquivá-lo manualmente.
+
+**O que observar:** o Access Analyzer não é uma checagem pontual — ele reavalia continuamente, então
+consertar a policy e o finding "sumir" sozinho (mudar para resolvido) é a prova de que o monitoramento é
+contínuo, não um scan único que você dispara manualmente.
 
 ---
 

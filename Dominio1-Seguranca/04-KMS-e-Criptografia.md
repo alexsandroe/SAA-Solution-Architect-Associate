@@ -60,6 +60,21 @@ sequenceDiagram
 
 **Detalhe técnico importante:** existe também a API `GenerateDataKeyWithoutPlaintext`, que devolve **só** a versão criptografada da Data Key — útil quando você quer distribuir a Data Key criptografada para vários lugares e só decriptar (chamando o KMS de novo) no momento exato do uso.
 
+#### 🔬 Mini-POC — envelope encryption de verdade, na mão
+
+**Por que fazer isso:** ler o diagrama é uma coisa, mas só descartando a Plaintext Data Key da sua própria memória e recuperando-a de volta via KMS é que o "a CMK nunca toca no dado" deixa de ser teoria.
+
+**Passos:**
+1. Crie uma CMK simétrica de teste: `aws kms create-key --description "poc-envelope"`.
+2. Gere uma Data Key: `aws kms generate-data-key --key-id <key-id> --key-spec AES_256 --output json > datakey.json`.
+3. Extraia o campo `Plaintext` (vem em base64) e decodifique para um arquivo binário: `jq -r .Plaintext datakey.json | base64 -d > datakey.bin`.
+4. Use essa chave para criptografar um arquivo local **sem chamar o KMS de novo**: `openssl enc -aes-256-cbc -in segredo.txt -out segredo.enc -pass file:datakey.bin`.
+5. Apague `datakey.bin` do disco (`rm datakey.bin`) — simulando o "descarte da Plaintext da memória".
+6. Extraia o `CiphertextBlob` de `datakey.json`, mande de volta ao KMS para recuperar a Plaintext: `aws kms decrypt --ciphertext-blob fileb://<(jq -r .CiphertextBlob datakey.json | base64 -d) --output text --query Plaintext | base64 -d > datakey.bin`.
+7. Use o `datakey.bin` recuperado para decriptar `segredo.enc` com `openssl` e confirme que bate com o original.
+
+**O que observar:** em nenhum momento o arquivo `segredo.txt` (que pode ter gigabytes, no mundo real) passou pelo KMS — só a Data Key de 32 bytes viajou até lá e voltou. Isso é o motivo pelo qual o KMS escala para criptografar volumes enormes de dados sem virar gargalo de rede.
+
 ---
 
 ## 2. Tipos de chave: AWS owned, AWS managed e Customer managed (CMK)
@@ -153,6 +168,20 @@ flowchart TD
 
 **O que muita gente erra na prova:** achar que "dar `kms:Decrypt` numa IAM Policy" é suficiente. Se a Key Policy da CMK não delega para IAM (ou nega explicitamente essa entidade), a IAM Policy não tem efeito nenhum sobre aquela chave específica.
 
+#### 🔬 Mini-POC — Key Policy vencendo uma IAM Policy permissiva
+
+**Por que fazer isso:** essa é a pegadinha mais repetida da prova sobre KMS, e é rápido comprovar na prática que uma IAM Policy com `kms:*`/`Resource: *` não basta sozinha.
+
+**Passos:**
+1. Crie uma CMK e, na Key Policy, defina uma statement que só concede `kms:*` ao seu próprio usuário admin (sem a statement padrão de `kms:*` para a conta root) — pode editar direto no console em "Key policy" → "Switch to policy view".
+2. Crie (ou use) uma segunda IAM role/usuário e anexe uma IAM Policy bem permissiva: `{"Effect":"Allow","Action":"kms:*","Resource":"*"}`.
+3. Assuma essa segunda role e tente `aws kms encrypt --key-id <key-id> --plaintext "teste"`.
+4. Observe o erro `AccessDeniedException`, mesmo com a IAM Policy liberando tudo.
+5. Volte à Key Policy e adicione uma statement explícita permitindo `kms:Encrypt`/`kms:Decrypt` para o ARN dessa segunda role.
+6. Repita o comando do passo 3 e confirme que agora funciona.
+
+**O que observar:** o resultado muda só mexendo na Key Policy, com a IAM Policy permissiva intacta o tempo todo — prova na prática que a Key Policy é o portão obrigatório, não a IAM Policy.
+
 ---
 
 ## 5. Grants — acesso temporário/programático
@@ -175,6 +204,21 @@ flowchart LR
     Svc -->|"RevokeGrant quando\nnão precisa mais"| Grant
 ```
 *Grants dão acesso programático e temporário, sem precisar editar a Key Policy a cada novo recurso.*
+
+#### 🔬 Mini-POC — criar, usar e revogar um Grant
+
+**Por que fazer isso:** grants são invisíveis no dia a dia (os serviços AWS os criam por você), então a única forma de realmente entender o ciclo de vida deles é criar um manualmente e observar o efeito da revogação.
+
+**Passos:**
+1. Crie uma CMK de teste e uma role/usuário que ainda **não** tem acesso a ela via Key Policy nem IAM.
+2. Crie um grant para essa role: `aws kms create-grant --key-id <key-id> --grantee-principal <arn-da-role> --operations Decrypt GenerateDataKey`.
+3. Guarde o `GrantId` e o `GrantToken` retornados.
+4. Assumindo a role concedida, chame `aws kms generate-data-key --key-id <key-id> --key-spec AES_256` e confirme que funciona — mesmo sem nenhuma statement na Key Policy ou IAM Policy para essa role.
+5. Liste os grants ativos na chave: `aws kms list-grants --key-id <key-id>`.
+6. Revogue o grant: `aws kms revoke-grant --key-id <key-id> --grant-id <grant-id>`.
+7. Repita o passo 4 e confirme que agora falha com `AccessDeniedException`.
+
+**O que observar:** o grant deu acesso sem tocar em Key Policy nem IAM Policy, e revogá-lo tirou o acesso instantaneamente — é exatamente esse mecanismo que serviços como EBS/RDS usam por baixo dos panos a cada novo volume/instância criptografados com sua CMK.
 
 ---
 
@@ -210,6 +254,19 @@ flowchart TD
 ```
 *Rotação troca só o material interno — nada que você referencia (ARN, dados já criptografados) precisa mudar.*
 
+#### 🔬 Mini-POC — confirmar que dado antigo continua decriptável após rotação
+
+**Por que fazer isso:** "a rotação não quebra nada" é fácil de aceitar de olhos fechados; é mais convincente decriptar, na mão, um dado criptografado antes de rotacionar a chave.
+
+**Passos:**
+1. Crie uma CMK simétrica e criptografe um texto de teste: `aws kms encrypt --key-id <key-id> --plaintext "dado antes da rotacao" --output text --query CiphertextBlob | base64 -d > antes.enc`.
+2. Habilite a rotação automática: `aws kms enable-key-rotation --key-id <key-id>`.
+3. Confirme o status: `aws kms get-key-rotation-status --key-id <key-id>`.
+4. Como a rotação real só acontece após ~1 ano, simule o "material novo" criptografando um segundo texto normalmente (`depois.enc`) — na prática o ARN/alias usado é idêntico nos dois casos, o que já mostra que a aplicação nunca precisa saber qual "versão" de material foi usada.
+5. Decripte `antes.enc`: `aws kms decrypt --ciphertext-blob fileb://antes.enc --output text --query Plaintext | base64 -d`.
+
+**O que observar:** o comando de decrypt não recebe (nem precisa receber) nenhuma informação sobre "qual geração" da chave foi usada — o KMS resolve isso internamente a partir dos metadados embutidos no próprio ciphertext, reforçando por que você nunca precisa recriptografar nada após uma rotação.
+
 ---
 
 ## 7. Multi-Region Keys
@@ -233,6 +290,18 @@ flowchart LR
     Data["Dado criptografado em us-east-1"] --> Decrypt["Decriptável em eu-west-1\nusando a réplica local\n(sem chamar us-east-1)"]
 ```
 *Chaves réplica compartilham o material da primária — permitem decriptar localmente em cada região.*
+
+#### 🔬 Mini-POC — criptografar numa região, decriptar em outra
+
+**Por que fazer isso:** o ponto central de Multi-Region Keys ("mesmo material criptográfico") só convence de verdade quando você criptografa numa região e decripta em outra sem nenhuma chamada de volta à região de origem.
+
+**Passos:**
+1. Crie a chave primária multi-region: `aws kms create-key --multi-region --description "poc-multiregion"` (em `us-east-1`, por exemplo).
+2. Replique para uma segunda região: `aws kms replicate-key --key-id <key-id> --replica-region eu-west-1`.
+3. Na região primária, criptografe um texto: `aws kms encrypt --region us-east-1 --key-id <key-id> --plaintext "dado multi-region" --output text --query CiphertextBlob | base64 -d > dado.enc`.
+4. Na região réplica, decripte o **mesmo** arquivo, usando o Key ID da réplica: `aws kms decrypt --region eu-west-1 --key-id <replica-key-id> --ciphertext-blob fileb://dado.enc`.
+
+**O que observar:** o decrypt em `eu-west-1` funciona apontando para a chave réplica, sem que nenhuma chamada precise ir até `us-east-1` — se você desligasse a chave primária (ou a região inteira ficasse indisponível), a réplica continuaria decriptando normalmente, o que é exatamente o cenário de disaster recovery que justifica o recurso.
 
 ---
 

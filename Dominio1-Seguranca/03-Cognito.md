@@ -98,6 +98,35 @@ Depois de um login bem-sucedido, o User Pool devolve três tokens:
 Token é mais usado no lado do cliente para exibir informações do usuário logado (nome, e-mail) sem
 precisar de outra chamada.
 
+#### 🔬 Mini-POC — Injetando uma claim customizada no JWT com Pre Token Generation
+
+**Por que fazer isso:** ler que o trigger "customiza claims do token" é abstrato; ver o `tenant_id` que
+você mesmo injetou aparecer dentro do JWT decodificado é o que fixa como o mecanismo realmente funciona.
+
+**Passos:**
+1. Crie uma função Lambda simples que recebe o evento do trigger `Pre token generation` e retorna, no
+   campo de resposta apropriado, uma claim extra:
+   ```json
+   {
+     "response": {
+       "claimsOverrideDetails": {
+         "claimsToAddOrOverride": { "tenant_id": "empresa-123" }
+       }
+     }
+   }
+   ```
+2. Associe essa função como trigger **Pre token generation** no seu User Pool.
+3. Faça login (via Hosted UI ou `admin-initiate-auth`) e obtenha o **ID Token** retornado.
+4. Decodifique o JWT (ele é só Base64 nas duas primeiras partes, separadas por `.`) — pode usar
+   `echo "PARTE_DO_PAYLOAD" | base64 -d` ou colar em jwt.io.
+5. Localize a claim `tenant_id: "empresa-123"` dentro do payload decodificado.
+6. Faça login de novo sem o trigger associado (desassocie temporariamente) e confirme que a claim some.
+
+**O que observar:** a claim aparece no **ID Token** mesmo você nunca tendo pedido isso explicitamente no
+momento do login — ela foi injetada de forma transparente pelo Lambda, antes da emissão. É exatamente esse
+mecanismo que permite, no dia a dia, evitar uma consulta extra ao backend só para descobrir a qual
+tenant/role um usuário pertence.
+
 ### MFA e Adaptive Authentication
 
 - **MFA** no User Pool suporta **SMS** e **TOTP** (aplicativo autenticador tipo Google
@@ -115,6 +144,29 @@ flowchart TD
     Risk -->|"Risco alto\n(local/dispositivo incomum)"| MFA["Exige MFA\nadicional"]
 ```
 *Adaptive Authentication ajusta a exigência de MFA dinamicamente conforme o risco calculado do login.*
+
+#### 🔬 Mini-POC — Observando o Adaptive Authentication reagir a um login "estranho"
+
+**Por que fazer isso:** é difícil forçar um sinal de risco artificialmente de forma perfeita, mas dá para
+observar o comportamento na prática usando uma VPN/rede diferente da que você usa no dia a dia — o
+suficiente para ver o mecanismo agir, em vez de só confiar na descrição teórica.
+
+**Passos:**
+1. Habilite **Advanced Security Features** no User Pool e configure Adaptive Authentication como
+   "Optional" (exige MFA quando o risco calculado for médio/alto).
+2. Faça login algumas vezes do seu dispositivo/rede normal — confirme que passa direto, sem pedir nada
+   extra (risco baixo, dispositivo/local já "conhecidos" pelo Cognito).
+3. Conecte-se a uma VPN de outro país (ou use uma rede móvel/4G diferente da habitual) e faça login de
+   novo com o mesmo usuário.
+4. Observe se o Cognito passa a exigir MFA adicional (mesmo que o usuário não tivesse MFA configurado
+   como obrigatório) ou marca a tentativa como risco elevado no console (**User Pool → Advanced security
+   → Risk detection**).
+5. Veja o log do evento de risco no Console, incluindo o motivo detectado (ex: "novo dispositivo", "local
+   incomum").
+
+**O que observar:** o mesmo usuário, com a mesma senha, é tratado de forma diferente dependendo do
+contexto do login — essa é a essência de "segurança adaptativa", e ver o Console classificar a tentativa
+como risco elevado deixa claro que não é MFA fixo ligado/desligado, é uma decisão calculada por evento.
 
 ---
 
@@ -164,6 +216,27 @@ sequenceDiagram
     App->>S3: Acessa direto com as credenciais\n(sem passar por um backend seu)
 ```
 *Fluxo completo: login no User Pool gera JWT; o Identity Pool troca esse JWT por credenciais temporárias da AWS via STS.*
+
+#### 🔬 Mini-POC — Credenciais AWS sem nenhum login (guest/unauthenticated access)
+
+**Por que fazer isso:** a ideia de "credencial AWS temporária sem login nenhum" soa estranha até você
+mesmo obter uma via CLI, sem passar usuário/senha em lugar nenhum, e confirmar o quão restrita ela é.
+
+**Passos:**
+1. Num Identity Pool, habilite **"Allow unauthenticated identities"**.
+2. Configure a Role **não-autenticada** com uma policy bem restrita — ex: só `s3:GetObject` num prefixo
+   público específico (`arn:aws:s3:::meu-bucket/publico/*`).
+3. Sem fazer login nenhum, obtenha um Identity ID anônimo:
+   `aws cognito-identity get-id --identity-pool-id SEU_IDENTITY_POOL_ID`
+4. Troque esse Identity ID por credenciais, sem passar nenhum token de login:
+   `aws cognito-identity get-credentials-for-identity --identity-id ID_RETORNADO_ACIMA`
+5. Use as credenciais retornadas para tentar ler um objeto do prefixo público — deve funcionar.
+6. Tente usar as mesmas credenciais para ler um objeto **fora** do prefixo público (ex:
+   `meu-bucket/privado/arquivo.txt`) — deve falhar com `AccessDenied`.
+
+**O que observar:** você conseguiu credenciais AWS reais e funcionais sem autenticar em lugar nenhum —
+isso só é seguro porque a Role associada é extremamente restrita. É o mesmo padrão usado, por exemplo,
+para permitir que um app mostre um catálogo público antes do usuário logar.
 
 ---
 
@@ -264,6 +337,29 @@ flowchart TD
     Cenario -->|"App acessa S3/DynamoDB\ndiretamente, sem API no meio"| C2["User Pool + Identity Pool\n(JWT trocado por credenciais AWS)"]
 ```
 *Proteger uma API própria usa só o User Pool; acessar serviços AWS direto do cliente exige também o Identity Pool.*
+
+#### 🔬 Mini-POC — HTTP API protegida por JWT Authorizer: 401 sem token, 200 com token
+
+**Por que fazer isso:** a diferença entre "proteger uma API própria" (só User Pool) e "acessar AWS direto"
+(User Pool + Identity Pool) fica muito mais concreta vendo os dois códigos de status HTTP na prática.
+
+**Passos:**
+1. Crie uma HTTP API simples no API Gateway com uma rota `GET /perfil` apontando para qualquer integração
+   de teste (uma Lambda que só retorna `{"ok": true}` já basta).
+2. Crie um **JWT Authorizer** na HTTP API apontando para o seu User Pool como Issuer
+   (`https://cognito-idp.REGIAO.amazonaws.com/SEU_USER_POOL_ID`) e o App Client ID como audience.
+3. Associe o Authorizer à rota `GET /perfil`.
+4. Chame a rota sem nenhum header de autorização: `curl -i https://SEU_ENDPOINT/perfil` — confirme o
+   `401 Unauthorized`.
+5. Faça login (Hosted UI ou `admin-initiate-auth`) e pegue o **Access Token** retornado.
+6. Chame de novo com o token: `curl -i -H "Authorization: Bearer ACCESS_TOKEN" https://SEU_ENDPOINT/perfil`
+   — confirme o `200 OK`.
+7. Tente com um token propositalmente adulterado (mude um caractere no meio) e confirme que volta a dar
+   `401`.
+
+**O que observar:** em nenhum momento desse fluxo houve troca por credenciais AWS via STS — é só o
+próprio JWT sendo validado pelo API Gateway. Esse é o padrão que a seção 5 chama de "só User Pool", em
+contraste direto com o mini-POC de guest access da seção 2, que usa o Identity Pool para obter credenciais.
 
 ---
 

@@ -73,6 +73,19 @@ flowchart LR
 
 **No dia a dia:** a grande maioria dos times usa só Security Groups no cotidiano (é mais simples de raciocinar) e deixa a NACL default (permite tudo) como está. NACL customizada entra em cena principalmente quando você precisa de uma camada extra de "cinto de segurança" no nível de subnet — por exemplo, bloquear explicitamente um IP identificado num ataque, sem precisar mexer em Security Group nenhum (que exigiria tocar em cada instância/grupo afetado).
 
+#### 🔬 Mini-POC — a porta efêmera que ninguém lembra de liberar
+
+**Por que fazer isso:** "NACL é stateless" é só teoria até você mesmo quebrar uma conexão por esquecer a porta de resposta — é o erro mais comum de troubleshooting de rede na vida real, não só na prova.
+
+**Passos:**
+1. Com duas instâncias na mesma VPC (`A` cliente, `B` servidor rodando algo simples, ex: `python3 -m http.server 8080`), configure o Security Group de `B` permitindo apenas **entrada** TCP 8080 vindo do SG de `A` — sem nenhuma regra de saída customizada.
+2. De `A`, rode `curl B_IP:8080` — funciona (SG é stateful, a resposta sai automaticamente).
+3. Agora, na NACL da subnet de `B`, remova a regra default "allow all" e adicione **só** uma regra de entrada permitindo TCP 8080 do CIDR de `A` — sem nenhuma regra de saída.
+4. Repita o `curl` de `A` — a conexão trava/expira.
+5. Adicione uma regra de **saída** na NACL de `B` permitindo a faixa de portas efêmeras (`1024-65535`) de volta para o CIDR de `A`, e teste novamente.
+
+**O que observar:** o mesmo cenário funciona com só a regra de SG (porque é stateful) e falha com só a regra de entrada na NACL (porque é stateless) — e só volta a funcionar depois de liberar explicitamente a porta efêmera de saída. Esse é exatamente o erro de troubleshooting mais comum em ambientes reais com NACL customizada.
+
 ---
 
 ## 2. VPC Endpoints — acessando serviços AWS sem passar pela internet
@@ -123,6 +136,19 @@ flowchart TD
 *Gateway Endpoint é uma rota gratuita só para S3/DynamoDB; Interface Endpoint é um ENI pago que "projeta" praticamente qualquer outro serviço para dentro da VPC.*
 
 **Pegadinha clássica de prova:** "preciso acessar o S3 de uma subnet totalmente privada, sem NAT Gateway, com o menor custo possível" → **Gateway Endpoint**, não Interface Endpoint (mesmo S3 também tendo suporte via Interface Endpoint em alguns cenários específicos — mas a resposta padrão de menor custo para S3/DynamoDB é sempre Gateway Endpoint).
+
+#### 🔬 Mini-POC — S3 sem nenhum caminho para a internet
+
+**Por que fazer isso:** a prova adora a frase "zero rota para internet" — a única forma de confiar de verdade que isso é possível é remover a rota e provar que o S3 ainda responde.
+
+**Passos:**
+1. Numa subnet privada **sem** rota `0.0.0.0/0` (nem NAT Gateway, nem Internet Gateway) e sem Gateway Endpoint ainda, tente `aws s3 ls` de uma instância nela — deve falhar/travar por falta de rota.
+2. Crie o Gateway Endpoint para S3 e associe-o à route table dessa subnet.
+3. Repita `aws s3 ls` — agora funciona.
+4. Adicione uma **Endpoint Policy** restringindo o endpoint a um único bucket específico (`Resource: arn:aws:s3:::meu-bucket-permitido/*`).
+5. Tente acessar esse bucket permitido (funciona) e outro bucket qualquer da conta (falha com `AccessDenied`, mesmo que a IAM Role da instância tenha permissão total de S3).
+
+**O que observar:** o endpoint por si só já prova que dá para falar com o S3 sem nenhuma rota de internet; a Endpoint Policy mostra uma segunda camada de controle — o tráfego pode estar tecnicamente liberado pela IAM Role, mas o **caminho de rede** (o endpoint) impõe seu próprio limite, independente da IAM Policy do usuário/role.
 
 ---
 
@@ -206,6 +232,18 @@ flowchart TD
 *Bastion Host exige porta de entrada exposta e gestão de chaves; Session Manager elimina ambos, autenticando via IAM e logando tudo nativamente.*
 
 **No dia a dia:** Session Manager é hoje a recomendação padrão da AWS e da maioria das empresas modernas — a única razão real para ainda usar Bastion Host é compatibilidade com ferramentas legadas que dependem especificamente de um túnel SSH tradicional, ou acesso a sistemas que não são EC2 (embora Session Manager também suporte port forwarding para outros destinos dentro da VPC, cobrindo boa parte desses casos também).
+
+#### 🔬 Mini-POC — quem acessou o quê, sem nenhuma porta aberta
+
+**Por que fazer isso:** o argumento de venda do Session Manager é "autenticação via IAM + auditoria nativa" — vale confirmar isso indo direto no CloudTrail, não só confiando na teoria.
+
+**Passos:**
+1. Numa instância com **zero regras de entrada** no Security Group (nenhuma, nem 22 nem 3389) e a IAM Role `AmazonSSMManagedInstanceCore` anexada, inicie uma sessão: `aws ssm start-session --target i-xxxxxxxx`.
+2. Rode alguns comandos dentro da sessão e encerre com `exit`.
+3. Crie um segundo usuário/role IAM **sem** a permissão `ssm:StartSession` e tente repetir o passo 1 com as credenciais dele — deve falhar com `AccessDenied`.
+4. Volte ao usuário original e rode `aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=StartSession`.
+
+**O que observar:** a sessão funciona sem nenhuma porta aberta, o segundo usuário é barrado puramente por IAM (nenhuma configuração de rede envolvida), e o CloudTrail mostra exatamente quem iniciou a sessão, quando e em qual instância — a auditoria "de fábrica" que um Bastion Host tradicional não oferece sem trabalho extra.
 
 ---
 

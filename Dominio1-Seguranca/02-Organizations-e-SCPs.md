@@ -212,6 +212,27 @@ Esse padrão (`NotAction` + `Deny`) é uma forma comum de dizer "negue tudo, exc
 necessárias (IAM/STS/Organizations em si são globais e normalmente ficam de fora dessa restrição de
 região)".
 
+#### 🔬 Mini-POC — Region-lock SCP derrubando até um `AdministratorAccess`
+
+**Por que fazer isso:** o laboratório principal deste arquivo testa o bloqueio de `ec2:TerminateInstance`;
+aqui a ideia é testar o exemplo de **restrição de região** — um padrão de SCP diferente e igualmente
+cobrado na prova — e ver na prática que ele barra até quem tem acesso total.
+
+**Passos:**
+1. Numa conta membro de teste, anexe a SCP de restrição de região do exemplo acima (permitindo só
+   `sa-east-1`/`us-east-1`, com exceção para `iam`/`sts`/`organizations`/`support`).
+2. Dentro dessa conta, use uma Role/usuário com `AdministratorAccess` anexado.
+3. Tente criar um recurso simples numa região **fora** da lista permitida, ex:
+   `aws s3api create-bucket --bucket poc-scp-regiao --region eu-west-1`
+4. Observe o erro de `AccessDenied` vindo da SCP, mesmo com `AdministratorAccess`.
+5. Repita o mesmo comando trocando a região para `us-east-1` (dentro do permitido) e confirme que funciona.
+6. Tente uma chamada de IAM (ex: `aws iam list-roles`) enquanto "fora" da região permitida — confirme que
+   funciona normalmente, porque `iam:*` está na lista de `NotAction` (exceção global).
+
+**O que observar:** a mensagem de erro do passo 3 não menciona a SCP nominalmente da mesma forma que um
+`AccessDenied` de IAM comum — para quem nunca viu isso, o primeiro instinto é "achar que a permissão IAM
+está errada". Aprender a reconhecer esse padrão de erro é o que realmente ajuda no troubleshooting real.
+
 ### Pegadinha clássica de prova: explicit deny em SCP sempre vence
 
 Mesmo que o IAM da conta membro tenha um `Allow` explícito e amplíssimo (`AdministratorAccess`), se a SCP
@@ -268,6 +289,29 @@ flowchart LR
     SCP["SCP com condição\naws:RequestTag"] -.->|"combine para\nbloqueio ativo"| Recurso
 ```
 *Tag Policy sozinha só reporta não-conformidade; bloqueio ativo exige combinar com SCP.*
+
+#### 🔬 Mini-POC — De "relatório" para "bloqueio ativo": Tag Policy + SCP juntas
+
+**Por que fazer isso:** o texto acima explica que Tag Policy sozinha não bloqueia nada — a forma mais
+direta de internalizar isso é criar um recurso sem a tag exigida (e ver que **funciona**), e só depois
+adicionar a SCP que realmente impede a criação.
+
+**Passos:**
+1. Crie uma Tag Policy exigindo a chave `CostCenter` em buckets S3, com valores permitidos
+   `eng`/`mkt`/`ops`.
+2. Crie um bucket **sem** essa tag: `aws s3 mb s3://poc-tag-sem-cost-center`. Confirme que funciona sem
+   erro nenhum — a Tag Policy, sozinha, não impediu a criação.
+3. No Console do Organizations, veja o bucket aparecer no relatório de não-conformidade da Tag Policy.
+4. Agora anexe, na mesma OU, uma SCP com `Deny` em `s3:CreateBucket` condicionada a
+   `"Null": {"aws:RequestTag/CostCenter": "true"}` (ou seja: nega se a tag `CostCenter` não vier na
+   própria chamada de criação).
+5. Tente criar outro bucket sem a tag: `aws s3api create-bucket --bucket poc-tag-bloqueado`. Agora deve
+   falhar com `AccessDenied`.
+6. Crie o bucket passando a tag corretamente e confirme que funciona.
+
+**O que observar:** o passo 2 (sem SCP) e o passo 5 (com SCP) usam o mesmo tipo de ação, mas um passa e o
+outro é bloqueado — isso comprova de forma concreta a frase "Tag Policy reporta, SCP é quem de fato
+impede", em vez de só aceitar essa afirmação de memória para a prova.
 
 ---
 
@@ -352,6 +396,30 @@ flowchart LR
     MultiConta --> Lifecycle["Ciclo de vida independente\npor ambiente (dev/stg/prod)"]
 ```
 *Os cinco motivadores mais citados na prática para adotar uma estratégia multi-conta.*
+
+#### 🔬 Mini-POC — Service quotas são isoladas por conta, na prática
+
+**Por que fazer isso:** "limites de serviço são por conta" costuma ser lido e aceito sem verificação — é
+rápido confirmar isso de verdade consultando a API de Service Quotas em duas contas diferentes e ver que
+uma não enxerga nem afeta a outra.
+
+**Passos:**
+1. Escolha uma quota concreta e fácil de checar, ex: número de VPCs por região
+   (`L-F678F1CE`, serviço `vpc`).
+2. Na Conta A: `aws service-quotas get-service-quota --service-code vpc --quota-code L-F678F1CE`
+   — anote o valor e, se quiser, `aws service-quotas list-requested-service-quota-change-history` para
+   ver o histórico.
+3. Rode a mesma consulta na Conta B (uma segunda conta da mesma Organization, ou uma conta pessoal
+   separada). Compare os valores — cada conta tem sua própria quota, independente da outra.
+4. Se disponível, crie recursos na Conta A até chegar perto do limite (cuidado com custo/tempo — para VPC
+   o limite padrão costuma ser baixo, então é rápido de testar) e confirme via
+   `get-service-quota` que o "uso atual" reportado é específico da Conta A.
+5. Confirme na Conta B que a quota dela permanece intacta, sem nenhuma redução pelo consumo da Conta A.
+
+**O que observar:** mesmo dentro da mesma Organization, com billing consolidado, as quotas de serviço não
+são compartilhadas nem somadas entre contas — cada conta tem seu próprio teto técnico, reforçando por que
+"isolar um time barulhento numa conta própria" protege os demais times de esgotamento de limite, não só de
+incidentes de segurança.
 
 ---
 

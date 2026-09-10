@@ -92,6 +92,21 @@ Quando você cria uma Web ACL, escolhe o escopo:
 
 **O que muita gente erra na prova:** tentar associar uma Web ACL criada com escopo `REGIONAL` (em `sa-east-1`, por exemplo) a uma distribution CloudFront — isso não é possível, você precisa recriar a Web ACL com escopo `CLOUDFRONT` em `us-east-1`.
 
+#### 🔬 Mini-POC — rate-based rule bloqueando na prática
+
+**Por que fazer isso:** ler sobre "bloqueia automaticamente acima de um limite" é abstrato até você ver a resposta HTTP mudar de `200` para `403` no meio de um loop de requisições.
+
+**Passos:**
+1. Crie uma Web ACL (escopo `REGIONAL`) e associe a um ALB de teste (ou uma distribution CloudFront simples).
+2. Adicione uma **rate-based rule** com limite baixo (ex: 100 requisições em 5 minutos por IP), ação `Block`.
+3. No seu terminal, rode um loop simples contra o endpoint:
+   ```bash
+   for i in $(seq 1 200); do curl -s -o /dev/null -w "%{http_code}\n" https://SEU-ENDPOINT/; done
+   ```
+4. Abra Console → WAF & Shield → sua Web ACL → **Metrics** enquanto o loop roda.
+
+**O que observar:** as primeiras dezenas de respostas voltam `200`; depois de ultrapassar o limite configurado, as respostas passam a `403` — e o contador `BlockedRequests` sobe nas métricas. Isso confirma que a contagem é por IP e por janela deslizante, não um limite global fixo.
+
 ---
 
 ## 2. AWS Shield — Standard vs Advanced
@@ -120,6 +135,17 @@ Diferente do WAF (que olha o **conteúdo** da requisição), Shield foca em prot
 **Uso real:** Shield Advanced faz sentido para empresas onde um ataque DDoS tem impacto financeiro real e mensurável — e-commerce em datas de pico, serviços financeiros, plataformas onde downtime custa caro o suficiente para justificar a assinatura. A maioria dos workloads pequenos/médios vive tranquilamente só com Shield Standard.
 
 **Pegadinha clássica de prova:** "proteção de camada 7 contra DDoS" sozinha não é suficiente para justificar Shield Advanced — WAF já ajuda bastante nisso. O que só o Shield Advanced traz e o WAF sozinho não traz é **DRT + cost protection + SLA de proteção com garantias contratuais**. Se a questão menciona "proteção contra custo inesperado gerado por ataque" ou "suporte especializado 24/7 durante ataque", a resposta é Shield Advanced.
+
+#### 🔬 Mini-POC — o que o Standard já cobre vs o que exige Advanced
+
+**Por que fazer isso:** muita gente nunca olhou o console do Shield porque o Standard "só funciona sozinho" — mas ver a diferença de visibilidade entre os dois planos deixa claro por que Advanced custa o que custa.
+
+**Passos:**
+1. Console → WAF & Shield → **Overview**. Observe que seus recursos (CloudFront, Route 53) já aparecem listados como protegidos, sem nenhuma ação sua — isso é o Shield Standard.
+2. Rode `aws shield describe-subscription` — numa conta sem Shield Advanced ativo, o comando retorna erro/indicação de que não há assinatura.
+3. Se você tiver acesso a uma conta com Shield Advanced ativo (ou apenas leia o retorno esperado), rode `aws shield describe-protection --resource-arn <arn-de-um-recurso-elegível>` e compare os campos retornados (métricas detalhadas, health check associado) com o que o Standard oferece (nada consultável via API).
+
+**O que observar:** o Standard é binário e invisível — está sempre ligado, mas não te dá nenhuma API/dashboard para consultar detalhes de um ataque específico. O Advanced é a diferença entre "confiar que está protegido" e "ter dados e um time para agir durante o ataque".
 
 ```mermaid
 flowchart TD
@@ -222,6 +248,22 @@ flowchart TD
 
 **Diferença chave vs WAF (pegadinha de prova):** WAF entende HTTP/HTTPS e o conteúdo de uma requisição de aplicação. Network Firewall entende tráfego de rede em geral (qualquer protocolo), incluindo coisas que o WAF nunca veria, como tráfego DNS, FTP, ou qualquer protocolo customizado trafegando dentro da VPC. Se a questão menciona "bloquear domínios específicos no tráfego de saída da VPC" ou "inspeção de pacote em nível de rede, não só HTTP", a resposta é Network Firewall, não WAF.
 
+#### 🔬 Mini-POC — bloqueando um domínio específico no tráfego de saída
+
+**Por que fazer isso:** a diferença "Network Firewall entende domínio, Security Group não" só fica óbvia quando você tenta fazer a mesma coisa com um Security Group primeiro e vê que é impossível.
+
+**Passos:**
+1. Numa VPC de teste com subnet dedicada ao Network Firewall na frente do Internet Gateway, crie uma **stateful rule group** do tipo "domain list" bloqueando um domínio de teste (ex: `example-blocked.com`), ação `DENY`.
+2. Crie uma firewall policy associando essa rule group, e associe a policy ao firewall.
+3. De uma instância na subnet privada atrás do firewall, tente:
+   ```bash
+   curl -I https://example-blocked.com
+   curl -I https://aws.amazon.com
+   ```
+4. Compare o resultado com uma tentativa equivalente usando apenas Security Group/NACL (tente bloquear só esse domínio com uma NACL — perceba que só dá para bloquear por IP/CIDR, não por nome de domínio).
+
+**O que observar:** a chamada ao domínio bloqueado trava/falha (timeout ou reset), enquanto o restante do tráfego HTTPS passa normalmente — e você confirma na prática que NACL/SG não teriam como replicar esse bloqueio por domínio, só por IP.
+
 ---
 
 ## 5. AWS Certificate Manager (ACM)
@@ -252,6 +294,19 @@ Para emitir um certificado público, o ACM precisa confirmar que você realmente
 Certificados emitidos pelo ACM têm validade de 13 meses, mas o ACM tenta renovar automaticamente a partir de 60 dias antes de expirar — **desde que a validação (DNS ou email) continue funcionando**. Se o registro DNS de validação for removido, ou o certificado tiver sido importado manualmente (não emitido pelo ACM), a renovação automática não funciona e você precisa agir manualmente.
 
 **Pegadinha clássica de prova:** um certificado **importado** para o ACM (ex: você comprou de uma CA terceira e só fez upload) **não é renovado automaticamente** pela AWS — a renovação automática só existe para certificados **emitidos pelo próprio ACM**.
+
+#### 🔬 Mini-POC — do PENDING_VALIDATION ao ISSUED
+
+**Por que fazer isso:** ver o status do certificado mudar sozinho depois de criar um único registro DNS é o que torna intuitivo por que "validação por DNS" é sempre a resposta certa quando disponível.
+
+**Passos:**
+1. Console → Certificate Manager (região correta: `us-east-1` se for para CloudFront) → **Request a certificate** → Public certificate, informando um domínio que você controle no Route 53.
+2. Escolha **DNS validation** e confirme — o status inicial é `PENDING_VALIDATION`.
+3. Console → ACM → detalhes do certificado → copie o registro **CNAME** de validação exigido (nome e valor).
+4. Se o domínio estiver no Route 53, clique em **Create records in Route 53** (ou crie o CNAME manualmente em qualquer provedor DNS).
+5. Aguarde alguns minutos e rode `aws acm describe-certificate --certificate-arn <arn>` repetidamente.
+
+**O que observar:** o campo `Status` passa de `PENDING_VALIDATION` para `ISSUED` sem nenhuma ação manual adicional além de criar o CNAME uma única vez — e esse mesmo CNAME é o que permite a renovação automática futura, sem você precisar voltar a esta tela nunca mais.
 
 ### Onde o ACM pode ser usado
 

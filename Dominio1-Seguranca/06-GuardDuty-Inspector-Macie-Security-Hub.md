@@ -61,6 +61,19 @@ flowchart LR
 ```
 *GuardDuty consome logs que a AWS já coleta — não precisa de agente em nenhuma instância.*
 
+#### 🔬 Mini-POC — do finding de amostra até a severidade real
+
+**Por que fazer isso:** habilitar o GuardDuty é um clique, mas a maioria das pessoas nunca chega a olhar a anatomia de um finding real — e é aí que mora o que a prova cobra (tipo, severidade, recurso afetado).
+
+**Passos:**
+1. Habilite o GuardDuty: `aws guardduty create-detector --enable` (anote o `DetectorId` retornado).
+2. Gere findings de amostra cobrindo tipos diferentes: `aws guardduty create-sample-findings --detector-id <detector-id> --finding-types Backdoor:EC2/XORDDOS Recon:EC2/PortProbeUnprotectedPort UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B`.
+3. Liste os IDs gerados: `aws guardduty list-findings --detector-id <detector-id>`.
+4. Puxe o detalhe de um deles: `aws guardduty get-findings --detector-id <detector-id> --finding-ids <finding-id>`.
+5. No JSON retornado, localize os campos `severity` (número), `type` (categoria do achado) e `resource` (o que foi afetado).
+
+**O que observar:** o campo `type` segue um padrão `Categoria:RecursoAfetado/NomeDaAmeaça` (ex: `UnauthorizedAccess:IAMUser/...`) — uma vez que você reconhece esse padrão, decodificar qualquer finding novo do GuardDuty (inclusive numa questão de prova) fica muito mais rápido do que memorizar nomes soltos.
+
 ---
 
 ## 2. Amazon Inspector — scanning de vulnerabilidades
@@ -118,6 +131,19 @@ flowchart LR
 ```
 *Macie combina descoberta de dado sensível com a configuração de segurança do bucket que o guarda.*
 
+#### 🔬 Mini-POC — Macie encontrando um CPF fictício dentro de um bucket
+
+**Por que fazer isso:** ver o Macie realmente sinalizar um arquivo específico como sensível fixa muito mais do que ler "ele usa ML para achar PII" — e mostra na prática o tipo de dado que ele reconhece.
+
+**Passos:**
+1. Crie um bucket de teste e suba um arquivo texto com dados fictícios óbvios, por exemplo `dados.txt` contendo: `Cliente: Joao Silva, CPF: 123.456.789-00, Cartao: 4111 1111 1111 1111`.
+2. Habilite o Macie: `aws macie2 enable-macie`.
+3. Crie um job de classificação apontando para o bucket: `aws macie2 create-classification-job --job-type ONE_TIME --name "poc-macie" --s3-job-definition '{"bucketDefinitions":[{"accountId":"<sua-conta>","buckets":["<seu-bucket>"]}]}'`.
+4. Aguarde o job concluir (`aws macie2 describe-classification-job --job-id <job-id>`) e liste os achados: `aws macie2 list-findings`.
+5. Detalhe um achado: `aws macie2 get-findings --finding-ids <finding-id>`.
+
+**O que observar:** no resultado, o campo de categoria de dado sensível identifica especificamente o tipo (ex: `CREDIT_CARD_NUMBER`, dado brasileiro de CPF via categoria customizada/regex) e aponta o objeto exato dentro do bucket — não é uma sinalização genérica de "bucket suspeito", é achado por arquivo e por tipo de dado.
+
 ---
 
 ## 4. AWS Security Hub — agregador central
@@ -150,6 +176,18 @@ flowchart TD
     SH --> EB["EventBridge → Lambda\n(remediação automática)"]
 ```
 *Security Hub não detecta nada sozinho — ele agrega, padroniza (ASFF) e centraliza a resposta e a visualização.*
+
+#### 🔬 Mini-POC — ver um finding do GuardDuty reaparecer automaticamente no Security Hub
+
+**Por que fazer isso:** é a melhor forma de provar, na prática, a frase "Security Hub não detecta nada, só agrega" — gerando o finding num serviço e observando-o surgir no outro sem nenhuma ação manual de "importar".
+
+**Passos:**
+1. Com o GuardDuty já habilitado (ver mini-POC da seção 1), habilite o Security Hub: `aws securityhub enable-security-hub`.
+2. Gere (ou reutilize) um finding de amostra no GuardDuty: `aws guardduty create-sample-findings --detector-id <detector-id> --finding-types Backdoor:EC2/XORDDOS`.
+3. Aguarde 1-2 minutos e busque no Security Hub filtrando pelo produto de origem: `aws securityhub get-findings --filters '{"ProductName":[{"Value":"GuardDuty","Comparison":"EQUALS"}]}'`.
+4. Compare o `Id`/`Type` do finding retornado com o finding original do GuardDuty do passo 2.
+
+**O que observar:** o mesmo achado aparece nos dois lugares, mas no Security Hub ele vem envelopado no formato **ASFF** (com campos padronizados como `ProductArn`, `Severity.Label`, `Resources`) — é essa normalização, e não uma nova detecção, que o Security Hub adiciona ao dado que o GuardDuty já tinha gerado sozinho.
 
 ---
 

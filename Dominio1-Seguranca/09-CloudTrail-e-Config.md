@@ -87,6 +87,24 @@ flowchart TD
 ```
 *Entrega dupla (S3 para arquivo, CloudWatch Logs para alarme em tempo real) e a cadeia de digests que garante integridade dos logs.*
 
+#### 🔬 Mini-POC — reconstruindo "quem fez isso" a partir do zero
+
+**Por que fazer isso:** o valor real do CloudTrail só aparece quando você usa ele para responder a uma pergunta forense de verdade, em vez de só ler a definição de "log de API calls".
+
+**Passos:**
+1. Crie um bucket S3 de teste: `aws s3 mb s3://poc-cloudtrail-<sufixo-unico>`.
+2. Delete o mesmo bucket: `aws s3 rb s3://poc-cloudtrail-<sufixo-unico>`.
+3. Espere alguns minutos (CloudTrail não é instantâneo) e rode:
+   ```bash
+   aws cloudtrail lookup-events \
+     --lookup-attributes AttributeKey=EventName,AttributeValue=DeleteBucket \
+     --max-results 5
+   ```
+4. No JSON retornado, identifique `Username`, `sourceIPAddress` e `eventTime` do evento.
+5. Repita a busca filtrando por `AttributeKey=ResourceName,AttributeValue=poc-cloudtrail-<sufixo-unico>` e confirme que aparecem tanto o `CreateBucket` quanto o `DeleteBucket`.
+
+**O que observar:** sem nenhuma configuração extra além do trail padrão, você reconstrói a linha do tempo completa de um recurso (quem criou, quem apagou, de onde) — exatamente o tipo de pergunta forense que a prova descreve como "descubra quem fez X".
+
 ---
 
 ## 2. AWS Config
@@ -125,6 +143,19 @@ Um **Config Aggregator** centraliza dados de Configuration Items e compliance de
 Pode ser configurado manualmente (lista explícita de contas) ou automaticamente via integração com **AWS Organizations** (inclui automaticamente contas novas que entrarem na organização).
 
 **No dia a dia:** essencial para times de segurança/compliance centralizados em empresas com múltiplas contas — é o equivalente, para o Config, do que o Organization Trail é para o CloudTrail e do que o Firewall Manager é para WAF/Shield/SG (ver `07-WAF-Shield-Network-Firewall-ACM.md`): um jeito de ter governança consistente sem depender de cada conta individual estar configurada corretamente.
+
+#### 🔬 Mini-POC — vendo o recurso mudar de status sozinho
+
+**Por que fazer isso:** "Config avalia continuamente" é abstrato até você ver o mesmo bucket mudar de `NON_COMPLIANT` para `COMPLIANT` sem você mexer em nenhuma regra, só corrigindo o recurso.
+
+**Passos:**
+1. Crie um bucket S3 de teste e **desabilite** o "Block Public Access" nele (deliberadamente, só para o teste).
+2. Ative a managed rule `s3-bucket-public-read-prohibited` no Config (Console → Config → Rules → Add rule).
+3. Aguarde a próxima avaliação (ou force com `aws configservice start-config-rules-evaluation --config-rule-names s3-bucket-public-read-prohibited`) e confira o status: `NON_COMPLIANT`.
+4. Corrija o bucket reabilitando o "Block Public Access".
+5. Force a avaliação de novo e confira o status.
+
+**O que observar:** o mesmo recurso, sem você tocar em nada na regra, passa de `NON_COMPLIANT` para `COMPLIANT` assim que sua configuração real muda — e no **Resource timeline** do bucket (Config → Resources) você vê os dois Configuration Items lado a lado, provando que Config é sobre o estado do recurso ao longo do tempo, não sobre quem fez a ação (isso é papel do CloudTrail).
 
 ```mermaid
 flowchart TD
